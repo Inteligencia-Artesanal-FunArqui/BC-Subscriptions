@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(mysql:*)",
+      "Bash(\"C:\\Program Files\\MySQL\\MySQL Server 8.0\\bin\\mysql.exe\" -u root -p12345678 -e \"CREATE DATABASE IF NOT EXISTS ositopolar_subscriptions;\")",
+      "Bash(\"C:\\Program Files\\MySQL\\MySQL Server 8.0\\bin\\mysql.exe\" -u root -p12345678 -e \"SHOW DATABASES LIKE ''ositopolar%'';\")",
+      "Bash(dotnet restore:*)",
+      "Bash(dotnet build:*)",
+      "Bash(timeout 15 dotnet run:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

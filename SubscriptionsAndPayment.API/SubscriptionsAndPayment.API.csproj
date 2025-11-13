@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+    <PropertyGroup>
+        <TargetFramework>net9.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <RootNamespace>OsitoPolar.Subscriptions.Service</RootNamespace>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <!-- ASP.NET Core -->
+        <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="9.0.0" />
+        <PackageReference Include="Swashbuckle.AspNetCore" Version="8.1.4" />
+        <PackageReference Include="Swashbuckle.AspNetCore.Annotations" Version="8.1.4" />
+
+        <!-- Entity Framework Core -->
+        <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.6" />
+        <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.6" />
+        <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="9.0.6">
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+            <PrivateAssets>all</PrivateAssets>
+        </PackageReference>
+        <PackageReference Include="MySql.EntityFrameworkCore" Version="9.0.3" />
+        <PackageReference Include="EntityFrameworkCore.CreatedUpdatedDate" Version="8.0.0" />
+
+        <!-- Payment Providers -->
+        <PackageReference Include="Stripe.net" Version="47.6.0" />
+
+        <!-- Utilities -->
+        <PackageReference Include="Humanizer" Version="2.14.1" />
+        <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+
+        <!-- ⚠️ IMPORTANTE: Mediator pattern (usado por Shared - NO ELIMINAR) -->
+        <PackageReference Include="Cortex.Mediator" Version="1.6.1" />
+    </ItemGroup>
+
+</Project>
