@@ -8,8 +8,10 @@ using OsitoPolar.Subscriptions.Service.Application.Internal.QueryServices;
 using OsitoPolar.Subscriptions.Service.Infrastructure.Persistence.EFC.Configuration;
 using OsitoPolar.Subscriptions.Service.Infrastructure.Persistence.EFC.Repositories;
 using OsitoPolar.Subscriptions.Service.Infrastructure.External.Stripe;
+using OsitoPolar.Subscriptions.Service.Infrastructure.External.Http;
 using OsitoPolar.Subscriptions.Service.Shared.Infrastructure.Persistence.EFC.Configuration.Extensions;
 using OsitoPolar.Subscriptions.Service.Shared.Infrastructure.Interfaces.ASP.Configuration;
+using MassTransit;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -60,9 +62,46 @@ builder.Services.AddScoped<OsitoPolar.Subscriptions.Service.Shared.Domain.Reposi
 builder.Services.AddScoped<ISubscriptionCommandService, SubscriptionCommandService>();
 builder.Services.AddScoped<ISubscriptionQueryService, SubscriptionQueryService>();
 
+// HTTP Client for Profiles Service
+var profilesServiceUrl = builder.Configuration["ServiceUrls:Profiles"] ?? "http://profiles-service:8080";
+builder.Services.AddHttpClient<IProfilesHttpFacade, ProfilesHttpFacade>(client =>
+{
+    client.BaseAddress = new Uri(profilesServiceUrl);
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+
 // Stripe Configuration
 builder.Services.Configure<StripeConfiguration>(builder.Configuration.GetSection("Stripe"));
 builder.Services.AddScoped<IPaymentProvider, StripePaymentProvider>();
+
+// ===========================
+// MassTransit + RabbitMQ Configuration
+// ===========================
+builder.Services.AddMassTransit(x =>
+{
+    // Configure RabbitMQ
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        var rabbitMqHost = builder.Configuration["RabbitMQ:Host"] ?? "localhost";
+        var rabbitMqPort = builder.Configuration["RabbitMQ:Port"] ?? "5672";
+        var rabbitMqUser = builder.Configuration["RabbitMQ:Username"] ?? "guest";
+        var rabbitMqPass = builder.Configuration["RabbitMQ:Password"] ?? "guest";
+
+        cfg.Host($"rabbitmq://{rabbitMqHost}:{rabbitMqPort}", h =>
+        {
+            h.Username(rabbitMqUser);
+            h.Password(rabbitMqPass);
+        });
+
+        // Configure message retry policy
+        cfg.UseMessageRetry(r => r.Incremental(3, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2)));
+
+        // Auto-configure all consumers
+        cfg.ConfigureEndpoints(context);
+    });
+});
+
+Console.WriteLine("✅ MassTransit + RabbitMQ configured for Subscriptions Service");
 
 // Controllers
 builder.Services.AddControllers(options =>

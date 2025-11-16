@@ -4,6 +4,8 @@ using OsitoPolar.Subscriptions.Service.Domain.Model.ValueObjects;
 using OsitoPolar.Subscriptions.Service.Domain.Repositories;
 using OsitoPolar.Subscriptions.Service.Domain.Services;
 using OsitoPolar.Subscriptions.Service.Shared.Domain.Repositories;
+using MassTransit;
+using OsitoPolar.Shared.Events.Events;
 
 namespace OsitoPolar.Subscriptions.Service.Application.Internal.CommandServices;
 
@@ -14,19 +16,22 @@ public class PaymentCommandService : IPaymentCommandService
     private readonly ISubscriptionCommandService _subscriptionCommandService;
     private readonly IStripeService _stripeService;
     private readonly IUnitOfWork _unitOfWork;
+    private readonly IPublishEndpoint _publishEndpoint;
 
     public PaymentCommandService(
         IPaymentRepository paymentRepository,
         ISubscriptionRepository subscriptionRepository,
         ISubscriptionCommandService subscriptionCommandService,
         IStripeService stripeService,
-        IUnitOfWork unitOfWork)
+        IUnitOfWork unitOfWork,
+        IPublishEndpoint publishEndpoint)
     {
         _paymentRepository = paymentRepository;
         _subscriptionRepository = subscriptionRepository;
         _subscriptionCommandService = subscriptionCommandService;
         _stripeService = stripeService;
         _unitOfWork = unitOfWork;
+        _publishEndpoint = publishEndpoint;
     }
 
     public async Task<(Payment payment, string checkoutUrl)> Handle(CreatePaymentSessionCommand command)
@@ -89,6 +94,32 @@ public class PaymentCommandService : IPaymentCommandService
 
         _paymentRepository.Update(payment);
         await _unitOfWork.CompleteAsync();
+
+        // Publish PaymentProcessedEvent when payment is successful
+        if (status == PaymentStatus.Succeeded)
+        {
+            try
+            {
+                var paymentProcessedEvent = new PaymentProcessedEvent
+                {
+                    PaymentId = payment.Id,
+                    UserId = payment.UserId,
+                    SubscriptionId = payment.SubscriptionId,
+                    Amount = payment.Amount.Amount,
+                    Currency = payment.Amount.Currency,
+                    PaymentMethod = "Card",
+                    Status = "Succeeded",
+                    ProcessedAt = DateTime.UtcNow
+                };
+
+                await _publishEndpoint.Publish(paymentProcessedEvent);
+                Console.WriteLine($"[Subscriptions] Published PaymentProcessedEvent for Payment {payment.Id}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Subscriptions] WARNING: Failed to publish PaymentProcessedEvent: {ex.Message}");
+            }
+        }
 
         return payment;
     }
