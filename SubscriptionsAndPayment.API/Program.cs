@@ -46,6 +46,11 @@ builder.Services.AddScoped<IPaymentRepository, PaymentRepository>();
 builder.Services.AddScoped<ISubscriptionRepository, SubscriptionRepository>();
 builder.Services.AddScoped<IServicePaymentRepository, ServicePaymentRepository>();
 
+// Dependency Injection - ACL Facades
+// ⚠️ DISABLED: SubscriptionContextFacade has monolith dependencies - needs HTTP communication rewrite
+// builder.Services.AddScoped<OsitoPolar.Subscriptions.Service.SubscriptionsAndPayments.Interfaces.ACL.ISubscriptionContextFacade,
+//     OsitoPolar.Subscriptions.Service.SubscriptionsAndPayments.Application.ACL.SubscriptionContextFacade>();
+
 // Dependency Injection - UnitOfWork
 builder.Services.AddScoped<OsitoPolar.Subscriptions.Service.Shared.Domain.Repositories.IUnitOfWork, OsitoPolar.Subscriptions.Service.Shared.Infrastructure.Persistence.EFC.Repositories.UnitOfWork>();
 

@@ -88,6 +88,70 @@ public class SubscriptionsController(
             return Conflict(new { message = ex.Message });
         }
     }
+
+    /// <summary>
+    /// Gets subscription data for IAM registration flow.
+    /// </summary>
+    /// <param name="planId">The plan ID</param>
+    /// <returns>Subscription data including planId, planName, price, and maxClients</returns>
+    [HttpGet("{planId:int}/data")]
+    [SwaggerOperation(
+        Summary = "Get Subscription Data",
+        Description = "Returns subscription data for IAM Service registration flow.",
+        OperationId = "GetSubscriptionData")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Subscription data found", typeof(SubscriptionDataResource))]
+    [SwaggerResponse(StatusCodes.Status404NotFound, "Subscription not found")]
+    public async Task<IActionResult> GetSubscriptionData(int planId)
+    {
+        var query = new GetSubscriptionByIdQuery(planId);
+        var subscription = await subscriptionQueryService.Handle(query);
+        if (subscription is null) return NotFound();
+
+        var resource = new SubscriptionDataResource(
+            PlanId: subscription.Id,
+            PlanName: subscription.PlanName,
+            Price: subscription.Price.Amount,
+            MaxClients: subscription.MaxClients ?? 0
+        );
+
+        return Ok(resource);
+    }
+
+    /// <summary>
+    /// Gets subscription limits for registration validation.
+    /// </summary>
+    /// <param name="planId">The plan ID</param>
+    /// <returns>Subscription limits including maxEquipment and maxClients</returns>
+    [HttpGet("{planId:int}/limits")]
+    [SwaggerOperation(
+        Summary = "Get Subscription Limits",
+        Description = "Returns subscription limits for IAM Service registration flow.",
+        OperationId = "GetSubscriptionLimits")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Subscription limits found", typeof(SubscriptionLimitsResource))]
+    [SwaggerResponse(StatusCodes.Status404NotFound, "Subscription not found")]
+    public async Task<IActionResult> GetSubscriptionLimits(int planId)
+    {
+        var query = new GetSubscriptionByIdQuery(planId);
+        var subscription = await subscriptionQueryService.Handle(query);
+        if (subscription is null) return NotFound();
+
+        var resource = new SubscriptionLimitsResource(
+            MaxEquipment: subscription.MaxEquipment ?? 0,
+            MaxClients: subscription.MaxClients ?? 0
+        );
+
+        return Ok(resource);
+    }
 }
 
 public record UpgradeSubscriptionResource(int UserId, int PlanId);
+
+/// <summary>
+/// Lightweight resource for subscription data used in IAM registration
+/// </summary>
+public record SubscriptionDataResource(int PlanId, string PlanName, decimal Price, int MaxClients);
+
+/// <summary>
+/// Resource for subscription limits used in IAM registration validation
+/// </summary>
+public record SubscriptionLimitsResource(int MaxEquipment, int MaxClients);
