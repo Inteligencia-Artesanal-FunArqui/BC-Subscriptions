@@ -29,9 +29,17 @@ public class SubscriptionCommandService(
                 newPlan.PlanName, newPlan.MaxEquipment);
 
             // Update the owner's plan in the Profiles microservice via HTTP facade
+            // First we need to get the owner ID from the user ID
+            var ownerId = await profilesHttpFacade.FetchOwnerIdByUserId(command.UserId);
+            if (ownerId == 0)
+            {
+                logger.LogError("Owner not found for UserId: {UserId}", command.UserId);
+                throw new InvalidOperationException($"Owner not found for user {command.UserId}");
+            }
+
             var maxUnits = newPlan.MaxEquipment ?? 10; // Default to 10 if not specified
-            var updateSuccess = await profilesHttpFacade.UpdateOwnerPlanAsync(
-                command.UserId,
+            var updateSuccess = await profilesHttpFacade.UpdateOwnerPlan(
+                ownerId,
                 command.PlanId,
                 maxUnits);
 

@@ -90,6 +90,37 @@ public class SubscriptionsController(
     }
 
     /// <summary>
+    /// Gets full subscription plan data for IAM registration flow.
+    /// This endpoint is used by IAM Service to validate plans during registration.
+    /// </summary>
+    /// <param name="planId">The plan ID</param>
+    /// <returns>Full subscription plan data including price, currency, maxEquipment, and maxClients</returns>
+    [HttpGet("plans/{planId:int}")]
+    [SwaggerOperation(
+        Summary = "Get Subscription Plan for Registration",
+        Description = "Returns full subscription plan data for IAM Service registration flow.",
+        OperationId = "GetSubscriptionPlan")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Subscription plan found", typeof(SubscriptionPlanResource))]
+    [SwaggerResponse(StatusCodes.Status404NotFound, "Subscription plan not found")]
+    public async Task<IActionResult> GetSubscriptionPlan(int planId)
+    {
+        var query = new GetSubscriptionByIdQuery(planId);
+        var subscription = await subscriptionQueryService.Handle(query);
+        if (subscription is null) return NotFound();
+
+        var resource = new SubscriptionPlanResource(
+            Id: subscription.Id,
+            PlanName: subscription.PlanName,
+            Price: subscription.Price.Amount,
+            Currency: subscription.Price.Currency,
+            MaxEquipment: subscription.MaxEquipment,
+            MaxClients: subscription.MaxClients
+        );
+
+        return Ok(resource);
+    }
+
+    /// <summary>
     /// Gets subscription data for IAM registration flow.
     /// </summary>
     /// <param name="planId">The plan ID</param>
@@ -155,3 +186,15 @@ public record SubscriptionDataResource(int PlanId, string PlanName, decimal Pric
 /// Resource for subscription limits used in IAM registration validation
 /// </summary>
 public record SubscriptionLimitsResource(int MaxEquipment, int MaxClients);
+
+/// <summary>
+/// Full subscription plan resource for IAM registration validation
+/// Includes all fields needed by IAM Service to validate and create checkout sessions
+/// </summary>
+public record SubscriptionPlanResource(
+    int Id,
+    string PlanName,
+    decimal Price,
+    string Currency,
+    int? MaxEquipment,
+    int? MaxClients);
