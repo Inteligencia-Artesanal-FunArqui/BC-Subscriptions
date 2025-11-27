@@ -1,0 +1,255 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Swashbuckle.AspNetCore.Annotations;
+using OsitoPolar.Subscriptions.Service.Domain.Repositories;
+
+namespace OsitoPolar.Subscriptions.Service.Interfaces.REST;
+
+/// <summary>
+/// ACL Controller for Subscriptions Service
+/// Provides endpoints for inter-service communication (Analytics, etc.)
+/// </summary>
+[AllowAnonymous] // Inter-service communication - no auth required
+[ApiController]
+[Route("api/v1/subscriptions/acl")]
+[SwaggerTag("ACL Endpoints - Inter-service Communication")]
+public class SubscriptionsAclController : ControllerBase
+{
+    private readonly ISubscriptionRepository _subscriptionRepository;
+    private readonly IPaymentRepository _paymentRepository;
+    private readonly ILogger<SubscriptionsAclController> _logger;
+
+    public SubscriptionsAclController(
+        ISubscriptionRepository subscriptionRepository,
+        IPaymentRepository paymentRepository,
+        ILogger<SubscriptionsAclController> logger)
+    {
+        _subscriptionRepository = subscriptionRepository;
+        _paymentRepository = paymentRepository;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Get total count of active subscriptions
+    /// </summary>
+    [HttpGet("stats/total-active")]
+    [SwaggerOperation(
+        Summary = "Get total active subscriptions count",
+        Description = "Returns total count of active subscriptions (called by Analytics Service)")]
+    [SwaggerResponse(200, "Active subscription count retrieved successfully")]
+    public async Task<IActionResult> GetTotalActiveSubscriptionsCount()
+    {
+        try
+        {
+            _logger.LogInformation("ACL: Fetching total active subscriptions count");
+            var subscriptions = await _subscriptionRepository.ListAsync();
+            var activeCount = subscriptions.Count(s => s.IsActive);
+            return Ok(new { Count = activeCount });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching total active subscriptions count");
+            return StatusCode(500, new { message = "Internal server error" });
+        }
+    }
+
+    /// <summary>
+    /// Get subscription count by plan name
+    /// </summary>
+    [HttpGet("stats/by-plan/{planName}")]
+    [SwaggerOperation(
+        Summary = "Get subscription count by plan",
+        Description = "Returns subscription count for the specified plan (called by Analytics Service)")]
+    [SwaggerResponse(200, "Subscription count retrieved successfully")]
+    public async Task<IActionResult> GetSubscriptionCountByPlan(string planName)
+    {
+        try
+        {
+            _logger.LogInformation("ACL: Fetching subscription count for plan {PlanName}", planName);
+            var subscriptions = await _subscriptionRepository.ListAsync();
+            var count = subscriptions.Count(s => s.PlanName.Equals(planName, StringComparison.OrdinalIgnoreCase));
+            return Ok(new { Count = count });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching subscription count for plan {PlanName}", planName);
+            return StatusCode(500, new { message = "Internal server error" });
+        }
+    }
+
+    /// <summary>
+    /// Get total revenue for a date range
+    /// </summary>
+    [HttpGet("stats/revenue")]
+    [SwaggerOperation(
+        Summary = "Get total revenue",
+        Description = "Returns total revenue for the specified date range (called by Analytics Service)")]
+    [SwaggerResponse(200, "Revenue retrieved successfully")]
+    public async Task<IActionResult> GetTotalRevenue([FromQuery] DateTime startDate, [FromQuery] DateTime endDate)
+    {
+        try
+        {
+            _logger.LogInformation("ACL: Fetching total revenue from {StartDate} to {EndDate}", startDate, endDate);
+            var payments = await _paymentRepository.ListAsync();
+
+            var totalRevenue = payments
+                .Where(p => p.PaymentDate >= startDate && p.PaymentDate <= endDate && p.IsSuccessful)
+                .Sum(p => p.Amount);
+
+            return Ok(new { TotalRevenue = totalRevenue });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching total revenue");
+            return StatusCode(500, new { message = "Internal server error" });
+        }
+    }
+
+    /// <summary>
+    /// Get monthly recurring revenue (MRR)
+    /// </summary>
+    [HttpGet("stats/mrr")]
+    [SwaggerOperation(
+        Summary = "Get monthly recurring revenue",
+        Description = "Returns current monthly recurring revenue (called by Analytics Service)")]
+    [SwaggerResponse(200, "MRR retrieved successfully")]
+    public async Task<IActionResult> GetMonthlyRecurringRevenue()
+    {
+        try
+        {
+            _logger.LogInformation("ACL: Fetching monthly recurring revenue");
+            var subscriptions = await _subscriptionRepository.ListAsync();
+
+            var mrr = subscriptions
+                .Where(s => s.IsActive)
+                .Sum(s => s.Price);
+
+            return Ok(new { MonthlyRecurringRevenue = mrr });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching monthly recurring revenue");
+            return StatusCode(500, new { message = "Internal server error" });
+        }
+    }
+
+    /// <summary>
+    /// Get revenue statistics summary
+    /// </summary>
+    [HttpGet("stats/revenue-summary")]
+    [SwaggerOperation(
+        Summary = "Get revenue statistics",
+        Description = "Returns comprehensive revenue statistics (called by Analytics Service)")]
+    [SwaggerResponse(200, "Statistics retrieved successfully")]
+    public async Task<IActionResult> GetRevenueStats()
+    {
+        try
+        {
+            _logger.LogInformation("ACL: Fetching revenue statistics");
+            var subscriptions = await _subscriptionRepository.ListAsync();
+            var payments = await _paymentRepository.ListAsync();
+
+            var totalRevenue = payments.Where(p => p.IsSuccessful).Sum(p => p.Amount);
+            var mrr = subscriptions.Where(s => s.IsActive).Sum(s => s.Price);
+            var totalActive = subscriptions.Count(s => s.IsActive);
+
+            // Group subscriptions by plan
+            var subscriptionsByPlan = subscriptions
+                .Where(s => s.IsActive)
+                .GroupBy(s => s.PlanName)
+                .ToDictionary(g => g.Key, g => g.Count());
+
+            // Calculate revenue by plan
+            var revenueByPlan = subscriptions
+                .Where(s => s.IsActive)
+                .GroupBy(s => s.PlanName)
+                .ToDictionary(g => g.Key, g => g.Sum(s => s.Price));
+
+            return Ok(new
+            {
+                TotalRevenue = totalRevenue,
+                MonthlyRecurringRevenue = mrr,
+                TotalActiveSubscriptions = totalActive,
+                SubscriptionsByPlan = subscriptionsByPlan,
+                RevenueByPlan = revenueByPlan
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching revenue statistics");
+            return StatusCode(500, new { message = "Internal server error" });
+        }
+    }
+
+    /// <summary>
+    /// Get subscription plan by ID
+    /// </summary>
+    [HttpGet("plans/{planId:int}")]
+    [SwaggerOperation(
+        Summary = "Get subscription plan by ID",
+        Description = "Returns subscription plan details (called by Analytics Service)")]
+    [SwaggerResponse(200, "Plan retrieved successfully")]
+    [SwaggerResponse(404, "Plan not found")]
+    public async Task<IActionResult> GetSubscriptionPlanById(int planId)
+    {
+        try
+        {
+            _logger.LogInformation("ACL: Fetching subscription plan {PlanId}", planId);
+            var plan = await _subscriptionRepository.FindByIdAsync(planId);
+
+            if (plan == null)
+            {
+                return NotFound(new { message = "Plan not found" });
+            }
+
+            return Ok(new
+            {
+                Id = plan.Id,
+                PlanName = plan.PlanName,
+                Price = plan.Price,
+                MaxClients = plan.MaxClients,
+                MaxEquipment = plan.MaxEquipment,
+                IsActive = plan.IsActive
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching subscription plan {PlanId}", planId);
+            return StatusCode(500, new { message = "Internal server error" });
+        }
+    }
+
+    /// <summary>
+    /// Get all subscription plans
+    /// </summary>
+    [HttpGet("plans")]
+    [SwaggerOperation(
+        Summary = "Get all subscription plans",
+        Description = "Returns all available subscription plans (called by Analytics Service)")]
+    [SwaggerResponse(200, "Plans retrieved successfully")]
+    public async Task<IActionResult> GetAllSubscriptionPlans()
+    {
+        try
+        {
+            _logger.LogInformation("ACL: Fetching all subscription plans");
+            var plans = await _subscriptionRepository.ListAsync();
+
+            var planList = plans.Select(p => new
+            {
+                Id = p.Id,
+                PlanName = p.PlanName,
+                Price = p.Price,
+                MaxClients = p.MaxClients,
+                MaxEquipment = p.MaxEquipment,
+                IsActive = p.IsActive
+            });
+
+            return Ok(planList);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error fetching all subscription plans");
+            return StatusCode(500, new { message = "Internal server error" });
+        }
+    }
+}
