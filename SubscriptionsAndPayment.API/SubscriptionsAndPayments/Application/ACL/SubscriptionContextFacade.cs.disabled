@@ -1,0 +1,70 @@
+using OsitoPolar.Subscriptions.Service.Domain.Repositories;
+using OsitoPolar.Subscriptions.Service.Interfaces.ACL;
+using OsitoPolarPlatform.API.Profiles.Domain.Repositories;
+
+namespace OsitoPolar.Subscriptions.Service.Application.ACL;
+
+/// <summary>
+/// Facade implementation for the Subscriptions and Payments context
+/// </summary>
+/// <param name="subscriptionRepository">The subscription repository</param>
+/// <param name="ownerRepository">The owner repository (to check current plan)</param>
+public class SubscriptionContextFacade(
+    ISubscriptionRepository subscriptionRepository,
+    IOwnerRepository ownerRepository) : ISubscriptionContextFacade
+{
+    public async Task<int> GetUserSubscriptionPlanId(int userId)
+    {
+        var owner = await ownerRepository.FindByUserIdAsync(userId);
+        return owner?.PlanId ?? 0;
+    }
+
+    public async Task<bool> CanUserAddMoreClients(int userId)
+    {
+        var owner = await ownerRepository.FindByUserIdAsync(userId);
+        if (owner == null) return false;
+
+        var plan = await subscriptionRepository.FindByIdAsync(owner.PlanId);
+        if (plan == null) return false;
+
+        // Check if current clients < max allowed by plan
+        // Assuming owner has a property to track current clients count
+        // This is a simplified version - adjust based on actual domain model
+        return true; // Placeholder - implement based on actual business logic
+    }
+
+    public decimal CalculateServiceCommission(decimal amount)
+    {
+        return amount * 0.15m; // 15% commission
+    }
+
+    public async Task<string> FetchSubscriptionPlanName(int planId)
+    {
+        var plan = await subscriptionRepository.FindByIdAsync(planId);
+        return plan?.PlanName ?? string.Empty;
+    }
+
+    public async Task<(int planId, string planName, decimal price, int maxClients)?> GetSubscriptionDataById(int planId)
+    {
+        var plan = await subscriptionRepository.FindByIdAsync(planId);
+        if (plan == null) return null;
+
+        return (plan.Id, plan.PlanName, plan.Price.Amount, plan.MaxClients ?? 0);
+    }
+
+    public async Task<(int maxEquipment, int maxClients)?> GetSubscriptionLimits(int planId)
+    {
+        var plan = await subscriptionRepository.FindByIdAsync(planId);
+        if (plan == null) return null;
+
+        return (plan.MaxEquipment ?? 10, plan.MaxClients ?? 50);
+    }
+
+    public async Task<(int planId, string planName, decimal price, string currency, int? maxEquipment, int? maxClients)?> GetFullSubscriptionData(int planId)
+    {
+        var plan = await subscriptionRepository.FindByIdAsync(planId);
+        if (plan == null) return null;
+
+        return (plan.Id, plan.PlanName, plan.Price.Amount, plan.Price.Currency, plan.MaxEquipment, plan.MaxClients);
+    }
+}

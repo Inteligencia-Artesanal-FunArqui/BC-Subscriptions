@@ -1,0 +1,308 @@
+using System.Net.Mime;
+using Microsoft.AspNetCore.Mvc;
+using Swashbuckle.AspNetCore.Annotations;
+using OsitoPolarPlatform.API.IAM.Domain.Model.Aggregates;
+using OsitoPolarPlatform.API.IAM.Infrastructure.Pipeline.Middleware.Attributes;
+using OsitoPolarPlatform.API.WorkOrders.Interfaces.ACL;
+using OsitoPolarPlatform.API.ServiceRequests.Interfaces.ACL;
+using OsitoPolarPlatform.API.Profiles.Interfaces.ACL;
+using OsitoPolar.Subscriptions.Service.Domain.Model.Aggregates;
+using OsitoPolar.Subscriptions.Service.Domain.Services;
+using OsitoPolar.Subscriptions.Service.Domain.Repositories;
+using OsitoPolar.Subscriptions.Service.Shared.Domain.Repositories;
+using OsitoPolarPlatform.API.Notifications.Interfaces.ACL;
+using Stripe;
+using Stripe.Checkout;
+
+namespace OsitoPolar.Subscriptions.Service.Interfaces.REST;
+
+/// <summary>
+/// Controller for service payments (Owner pays Provider after service completion)
+/// </summary>
+[ApiController]
+[Route("api/v1/service-payments")]
+[Produces(MediaTypeNames.Application.Json)]
+[SwaggerTag("Service Payments (Owner → Provider)")]
+public class ServicePaymentsController : ControllerBase
+{
+    private readonly IWorkOrderContextFacade _workOrderFacade;
+    private readonly IServiceRequestContextFacade _serviceRequestFacade;
+    private readonly IProfilesContextFacade _profilesFacade;
+    private readonly IServicePaymentRepository _servicePaymentRepository;
+    private readonly IUnitOfWork _unitOfWork;
+    private readonly INotificationContextFacade _notificationFacade;
+    private readonly ILogger<ServicePaymentsController> _logger;
+
+    // Platform commission percentage
+    private const decimal PLATFORM_FEE_PERCENTAGE = 15.0m; // 15%
+
+    public ServicePaymentsController(
+        IWorkOrderContextFacade workOrderFacade,
+        IServiceRequestContextFacade serviceRequestFacade,
+        IProfilesContextFacade profilesFacade,
+        IServicePaymentRepository servicePaymentRepository,
+        IUnitOfWork unitOfWork,
+        INotificationContextFacade notificationFacade,
+        ILogger<ServicePaymentsController> logger)
+    {
+        _workOrderFacade = workOrderFacade;
+        _serviceRequestFacade = serviceRequestFacade;
+        _profilesFacade = profilesFacade;
+        _servicePaymentRepository = servicePaymentRepository;
+        _unitOfWork = unitOfWork;
+        _notificationFacade = notificationFacade;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Create payment intent for completed service (Owner pays)
+    /// </summary>
+    [Authorize]
+    [HttpPost("create-checkout")]
+    [SwaggerOperation(
+        Summary = "Create Service Payment Checkout",
+        Description = "Owner creates payment for completed service. Returns Stripe checkout URL.",
+        OperationId = "CreateServicePaymentCheckout")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Checkout session created")]
+    [SwaggerResponse(StatusCodes.Status400BadRequest, "Invalid request or work order not resolved")]
+    [SwaggerResponse(StatusCodes.Status403Forbidden, "Only owners can pay for services")]
+    [SwaggerResponse(StatusCodes.Status404NotFound, "Work order not found")]
+    public async Task<IActionResult> CreateServicePaymentCheckout([FromBody] CreateServicePaymentResource resource)
+    {
+        try
+        {
+            // Verify user is an Owner
+            var user = (User?)HttpContext.Items["User"];
+            if (user == null)
+                return Unauthorized(new { message = "User not authenticated" });
+
+            var ownerId = await _profilesFacade.FetchOwnerIdByUserId(user.Id);
+            if (ownerId == 0)
+                return StatusCode(StatusCodes.Status403Forbidden,
+                    new { message = "Only owners can pay for services" });
+
+            _logger.LogInformation("Owner {OwnerId} creating payment for work order {WorkOrderId}",
+                ownerId, resource.WorkOrderId);
+
+            // Get work order
+            var workOrderData = await _workOrderFacade.GetWorkOrderData(resource.WorkOrderId);
+            if (workOrderData == null)
+                return NotFound(new { message = "Work order not found" });
+
+            // Verify work order is resolved and has a cost
+            if (workOrderData.Value.status != "Resolved")
+                return BadRequest(new { message = "Work order must be resolved before payment" });
+
+            if (!workOrderData.Value.cost.HasValue || workOrderData.Value.cost.Value <= 0)
+                return BadRequest(new { message = "Work order must have a valid cost" });
+
+            // Get service request
+            var serviceRequestData = await _serviceRequestFacade.GetServiceRequestData(workOrderData.Value.serviceRequestId!.Value);
+            if (serviceRequestData == null)
+                return NotFound(new { message = "Service request not found" });
+
+            // Verify owner owns this service request
+            if (serviceRequestData.Value.clientId != ownerId)
+                return StatusCode(StatusCodes.Status403Forbidden,
+                    new { message = "You can only pay for your own service requests" });
+
+            // Get provider company name
+            var providerCompanyName = await _profilesFacade.FetchProviderCompanyName(serviceRequestData.Value.companyId);
+            if (string.IsNullOrEmpty(providerCompanyName))
+                return NotFound(new { message = "Provider not found" });
+
+            // Calculate amounts
+            var totalAmount = workOrderData.Value.cost.Value;
+            var platformFee = Math.Round(totalAmount * (PLATFORM_FEE_PERCENTAGE / 100), 2);
+            var providerAmount = totalAmount - platformFee;
+
+            _logger.LogInformation(
+                "Payment breakdown - Total: ${Total}, Platform Fee: ${Fee} ({Percentage}%), Provider Gets: ${Provider}",
+                totalAmount, platformFee, PLATFORM_FEE_PERCENTAGE, providerAmount);
+
+            // Create ServicePayment record
+            var servicePayment = new ServicePayment(
+                workOrderData.Value.id,
+                serviceRequestData.Value.id,
+                ownerId,
+                serviceRequestData.Value.companyId,
+                totalAmount,
+                PLATFORM_FEE_PERCENTAGE,
+                $"Service payment for Work Order #{workOrderData.Value.workOrderNumber}");
+
+            await _servicePaymentRepository.AddAsync(servicePayment);
+            await _unitOfWork.CompleteAsync();
+
+            _logger.LogInformation("ServicePayment record created with ID: {PaymentId}", servicePayment.Id);
+
+            // Create Stripe Checkout Session
+            var successUrl = resource.SuccessUrl ?? "http://localhost:5173/payments/success";
+            var cancelUrl = resource.CancelUrl ?? "http://localhost:5173/payments/cancel";
+
+            var options = new SessionCreateOptions
+            {
+                PaymentMethodTypes = new List<string> { "card" },
+                LineItems = new List<SessionLineItemOptions>
+                {
+                    new SessionLineItemOptions
+                    {
+                        PriceData = new SessionLineItemPriceDataOptions
+                        {
+                            Currency = "usd",
+                            ProductData = new SessionLineItemPriceDataProductDataOptions
+                            {
+                                Name = $"Service Payment: {workOrderData.Value.title}",
+                                Description = $"Work Order #{workOrderData.Value.workOrderNumber} - {providerCompanyName}"
+                            },
+                            UnitAmount = (long)(totalAmount * 100), // Convert to cents
+                        },
+                        Quantity = 1,
+                    },
+                },
+                Mode = "payment",
+                SuccessUrl = $"{successUrl}?session_id={{CHECKOUT_SESSION_ID}}",
+                CancelUrl = cancelUrl,
+                Metadata = new Dictionary<string, string>
+                {
+                    { "paymentType", "service" },
+                    { "servicePaymentId", servicePayment.Id.ToString() },
+                    { "workOrderId", workOrderData.Value.id.ToString() },
+                    { "serviceRequestId", serviceRequestData.Value.id.ToString() },
+                    { "ownerId", ownerId.ToString() },
+                    { "providerId", serviceRequestData.Value.companyId.ToString() },
+                    { "totalAmount", totalAmount.ToString("F2") },
+                    { "platformFee", platformFee.ToString("F2") },
+                    { "providerAmount", providerAmount.ToString("F2") }
+                }
+            };
+
+            var service = new SessionService();
+            var session = await service.CreateAsync(options);
+
+            _logger.LogInformation("Stripe checkout session created: {SessionId}", session.Id);
+
+            return Ok(new
+            {
+                checkoutUrl = session.Url,
+                sessionId = session.Id,
+                totalAmount,
+                platformFee,
+                providerAmount,
+                platformFeePercentage = PLATFORM_FEE_PERCENTAGE,
+                workOrder = new
+                {
+                    id = workOrderData.Value.id,
+                    workOrderNumber = workOrderData.Value.workOrderNumber,
+                    title = workOrderData.Value.title,
+                    providerName = providerCompanyName
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error creating service payment checkout");
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Webhook to process service payment completion (called by Stripe)
+    /// </summary>
+    [HttpPost("webhook")]
+    [SwaggerOperation(
+        Summary = "Stripe Webhook for Service Payments",
+        Description = "Processes payment completion and updates provider balance",
+        OperationId = "ProcessServicePaymentWebhook")]
+    public async Task<IActionResult> ProcessWebhook()
+    {
+        try
+        {
+            var json = await new StreamReader(HttpContext.Request.Body).ReadToEndAsync();
+            var stripeEvent = EventUtility.ConstructEvent(json,
+                Request.Headers["Stripe-Signature"],
+                "your_webhook_secret"); // TODO: Move to configuration
+
+            _logger.LogInformation("Received Stripe webhook event: {EventType}", stripeEvent.Type);
+
+            if (stripeEvent.Type == "checkout.session.completed")
+            {
+                var session = stripeEvent.Data.Object as Session;
+                if (session?.Metadata?.ContainsKey("paymentType") == true &&
+                    session.Metadata["paymentType"] == "service")
+                {
+                    await ProcessServicePaymentCompletion(session);
+                }
+            }
+
+            return Ok();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing webhook");
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    private async Task ProcessServicePaymentCompletion(Session session)
+    {
+        var servicePaymentId = int.Parse(session.Metadata["servicePaymentId"]);
+        var workOrderId = int.Parse(session.Metadata["workOrderId"]);
+        var serviceRequestId = int.Parse(session.Metadata["serviceRequestId"]);
+        var ownerId = int.Parse(session.Metadata["ownerId"]);
+        var providerId = int.Parse(session.Metadata["providerId"]);
+        var providerAmount = decimal.Parse(session.Metadata["providerAmount"]);
+
+        _logger.LogInformation(
+            "Processing service payment completion - ServicePayment: {ServicePaymentId}, WorkOrder: {WorkOrderId}, Provider: {ProviderId}, Amount: ${Amount}",
+            servicePaymentId, workOrderId, providerId, providerAmount);
+
+        // Update ServicePayment record
+        var servicePayment = await _servicePaymentRepository.FindByIdAsync(servicePaymentId);
+        if (servicePayment != null)
+        {
+            servicePayment.MarkAsCompleted(
+                session.PaymentIntentId ?? session.Id,
+                session.Id);
+            _servicePaymentRepository.Update(servicePayment);
+
+            _logger.LogInformation("ServicePayment {PaymentId} marked as completed", servicePaymentId);
+        }
+
+        // Update provider balance
+        var balanceUpdated = await _profilesFacade.UpdateProviderBalance(providerId, providerAmount, $"Service payment for work order #{workOrderId}");
+        if (balanceUpdated)
+        {
+            _logger.LogInformation("Provider {ProviderId} balance updated with ${Amount}", providerId, providerAmount);
+        }
+
+        // Save all changes
+        await _unitOfWork.CompleteAsync();
+
+        // Generate notification for provider
+        var workOrderData = await _workOrderFacade.GetWorkOrderData(workOrderId);
+        if (workOrderData != null)
+        {
+            var providerUserId = await _profilesFacade.GetProviderUserIdByProviderId(providerId);
+            if (providerUserId > 0)
+            {
+                var message = $"Payment of ${providerAmount:F2} received for service: {workOrderData.Value.title}";
+                await _notificationFacade.CreateInAppNotification(
+                    providerUserId,
+                    "💰 Payment Received",
+                    message);
+
+                _logger.LogInformation("Payment notification sent to provider {ProviderId}", providerId);
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Resource for creating service payment
+/// </summary>
+public record CreateServicePaymentResource
+{
+    public int WorkOrderId { get; init; }
+    public string? SuccessUrl { get; init; }
+    public string? CancelUrl { get; init; }
+}

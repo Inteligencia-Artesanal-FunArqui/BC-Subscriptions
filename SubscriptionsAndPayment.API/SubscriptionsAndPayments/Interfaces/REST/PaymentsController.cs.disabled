@@ -1,0 +1,796 @@
+using System.Net.Mime;
+using Microsoft.AspNetCore.Mvc;
+using OsitoPolar.Subscriptions.Service.Infrastructure.External.Stripe;
+using OsitoPolar.Subscriptions.Service.Infrastructure.External.Culqi;
+using OsitoPolar.Subscriptions.Service.Infrastructure.External.Izipay;
+using OsitoPolar.Subscriptions.Service.Domain.Services;
+using OsitoPolar.Subscriptions.Service.Domain.Repositories;
+using OsitoPolar.Subscriptions.Service.Interfaces.ACL;
+using OsitoPolar.Subscriptions.Service.Domain.Model.Events;
+using OsitoPolarPlatform.API.Profiles.Interfaces.ACL;
+using OsitoPolarPlatform.API.EquipmentManagement.Interfaces.ACL;
+using OsitoPolarPlatform.API.EquipmentManagement.Domain.Model.Events;
+using OsitoPolar.Subscriptions.Service.Shared.Domain.Repositories;
+using OsitoPolar.Subscriptions.Service.Shared.Domain.Services;
+using OsitoPolarPlatform.API.Notifications.Interfaces.ACL;
+using Swashbuckle.AspNetCore.Annotations;
+using Stripe.Checkout;
+using OsitoPolar.Subscriptions.Service.Domain.Model.Aggregates;
+
+namespace OsitoPolar.Subscriptions.Service.Interfaces.REST;
+
+[ApiController]
+[Route("api/v1/[controller]")]
+[Produces(MediaTypeNames.Application.Json)]
+[SwaggerTag("Payment Testing Endpoints - Test different payment providers")]
+public class PaymentsController : ControllerBase
+{
+    private readonly StripePaymentProvider _stripeProvider;
+    private readonly CulqiPaymentProvider _culqiProvider;
+    private readonly IzipayPaymentProvider _izipayProvider;
+    private readonly IProfilesContextFacade _profilesFacade;
+    private readonly ISubscriptionContextFacade _subscriptionFacade;
+    private readonly IEquipmentContextFacade _equipmentFacade;
+    private readonly IPaymentRepository _paymentRepository;
+    private readonly IUnitOfWork _unitOfWork;
+    private readonly INotificationContextFacade _notificationFacade;
+    private readonly IEventBus _eventBus;
+
+    // Platform commission percentage for rental transactions
+    private const decimal PLATFORM_FEE_PERCENTAGE = 15.0m;
+
+    public PaymentsController(
+        StripePaymentProvider stripeProvider,
+        CulqiPaymentProvider culqiProvider,
+        IzipayPaymentProvider izipayProvider,
+        IProfilesContextFacade profilesFacade,
+        ISubscriptionContextFacade subscriptionFacade,
+        IEquipmentContextFacade equipmentFacade,
+        IPaymentRepository paymentRepository,
+        IUnitOfWork unitOfWork,
+        INotificationContextFacade notificationFacade,
+        IEventBus eventBus)
+    {
+        _stripeProvider = stripeProvider;
+        _culqiProvider = culqiProvider;
+        _izipayProvider = izipayProvider;
+        _profilesFacade = profilesFacade;
+        _subscriptionFacade = subscriptionFacade;
+        _equipmentFacade = equipmentFacade;
+        _paymentRepository = paymentRepository;
+        _unitOfWork = unitOfWork;
+        _notificationFacade = notificationFacade;
+        _eventBus = eventBus;
+    }
+
+    /// <summary>
+    /// Create Stripe Checkout Session for subscription payment
+    /// </summary>
+    [HttpPost("create-checkout-session")]
+    [SwaggerOperation(
+        Summary = "Create Stripe Checkout Session",
+        Description = "Creates a Stripe Checkout Session for plan subscription",
+        OperationId = "CreateCheckoutSession")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Checkout session created")]
+    [SwaggerResponse(StatusCodes.Status400BadRequest, "Invalid request")]
+    public async Task<IActionResult> CreateCheckoutSession([FromBody] CheckoutSessionRequest request)
+    {
+        try
+        {
+            // Use provided amount or default to $50 for testing
+            var amount = request.Amount > 0 ? request.Amount : 50.00m;
+
+            var options = new SessionCreateOptions
+            {
+                PaymentMethodTypes = new List<string> { "card" },
+                LineItems = new List<SessionLineItemOptions>
+                {
+                    new SessionLineItemOptions
+                    {
+                        PriceData = new SessionLineItemPriceDataOptions
+                        {
+                            Currency = "usd",
+                            ProductData = new SessionLineItemPriceDataProductDataOptions
+                            {
+                                Name = $"Subscription Plan #{request.PlanId}",
+                                Description = "Monthly subscription plan"
+                            },
+                            UnitAmount = (long)(amount * 100), // Convert to cents
+                        },
+                        Quantity = 1,
+                    },
+                },
+                Mode = "payment",
+                // Add {CHECKOUT_SESSION_ID} placeholder so Stripe includes session_id in redirect
+                SuccessUrl = $"{request.SuccessUrl}?session_id={{CHECKOUT_SESSION_ID}}",
+                CancelUrl = request.CancelUrl,
+                Metadata = new Dictionary<string, string>
+                {
+                    { "userId", request.UserId.ToString() },
+                    { "planId", request.PlanId.ToString() }
+                }
+            };
+
+            var service = new SessionService();
+            var session = await service.CreateAsync(options);
+
+            return Ok(new
+            {
+                sessionId = session.Id,
+                checkoutUrl = session.Url,  // Frontend expects checkoutUrl
+                url = session.Url,           // Keep url for compatibility
+                paymentId = session.PaymentIntentId  // Frontend expects paymentId
+            });
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Verify Stripe Checkout Session status
+    /// </summary>
+    [HttpGet("verify/{sessionId}")]
+    [SwaggerOperation(
+        Summary = "Verify Checkout Session",
+        Description = "Verifies the status of a Stripe Checkout Session after payment",
+        OperationId = "VerifyCheckoutSession")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Session verified")]
+    [SwaggerResponse(StatusCodes.Status404NotFound, "Session not found")]
+    public async Task<IActionResult> VerifyCheckoutSession(string sessionId)
+    {
+        try
+        {
+            var service = new SessionService();
+            var session = await service.GetAsync(sessionId);
+
+            return Ok(new
+            {
+                success = true,
+                paymentStatus = session.PaymentStatus,
+                customerEmail = session.CustomerEmail ?? session.CustomerDetails?.Email,
+                amountTotal = session.AmountTotal / 100m, // Convert from cents
+                currency = session.Currency?.ToUpper(),
+                metadata = session.Metadata
+            });
+        }
+        catch (Exception ex)
+        {
+            return NotFound(new { success = false, message = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Complete plan upgrade after successful Stripe payment
+    /// </summary>
+    [HttpPost("complete-upgrade")]
+    [SwaggerOperation(
+        Summary = "Complete Plan Upgrade",
+        Description = "Verifies Stripe payment and updates user's subscription plan",
+        OperationId = "CompletePlanUpgrade")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Plan upgraded successfully")]
+    [SwaggerResponse(StatusCodes.Status400BadRequest, "Upgrade failed")]
+    public async Task<IActionResult> CompletePlanUpgrade([FromBody] CompleteUpgradeRequest request)
+    {
+        try
+        {
+            Console.WriteLine($"[CompletePlanUpgrade] Processing session: {request.SessionId}");
+
+            // 1. Verify payment with Stripe
+            var service = new SessionService();
+            var session = await service.GetAsync(request.SessionId);
+
+            Console.WriteLine($"[CompletePlanUpgrade] Payment status: {session.PaymentStatus}");
+
+            if (session.PaymentStatus != "paid")
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = $"Payment not completed. Status: {session.PaymentStatus}"
+                });
+            }
+
+            // 2. Extract metadata
+            if (!session.Metadata.TryGetValue("userId", out var userIdStr) ||
+                !session.Metadata.TryGetValue("planId", out var planIdStr))
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Missing userId or planId in payment metadata"
+                });
+            }
+
+            var userId = int.Parse(userIdStr);
+            var planId = int.Parse(planIdStr);
+
+            Console.WriteLine($"[CompletePlanUpgrade] UserId: {userId}, PlanId: {planId}");
+
+            // 3. Get the new plan details
+            var planData = await _subscriptionFacade.GetSubscriptionDataById(planId);
+            if (planData == null)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = $"Plan {planId} not found"
+                });
+            }
+
+            Console.WriteLine($"[CompletePlanUpgrade] Plan: {planData.Value.planName}");
+
+            // 4. Create Payment record for this subscription
+            var payment = new Payment(
+                userId,
+                planId,
+                planData.Value.price,
+                session.Id,
+                session.CustomerEmail ?? session.CustomerDetails?.Email,
+                $"Subscription to {planData.Value.planName}"
+            );
+            await _paymentRepository.AddAsync(payment);
+
+            Console.WriteLine($"[CompletePlanUpgrade] Payment record created: {payment.Id}");
+
+            // 5. Update Owner or Provider plan
+            var ownerId = await _profilesFacade.FetchOwnerIdByUserId(userId);
+            if (ownerId > 0)
+            {
+                // Update Owner plan
+                var limits = await _subscriptionFacade.GetSubscriptionLimits(planId);
+                if (limits == null || limits.Value.maxEquipment == 0)
+                {
+                    return BadRequest(new
+                    {
+                        success = false,
+                        message = $"Plan {planId} is not an Owner plan"
+                    });
+                }
+
+                Console.WriteLine($"[CompletePlanUpgrade] Updating Owner {ownerId} to plan {planId}");
+                await _profilesFacade.UpdateOwnerPlan(ownerId, planId, limits.Value.maxEquipment);
+                await _unitOfWork.CompleteAsync();
+
+                Console.WriteLine($"[CompletePlanUpgrade] Owner plan updated successfully");
+
+                // Publish PaymentProcessedEvent for async communication
+                var paymentEvent = new PaymentProcessedEvent(
+                    payment.Id,
+                    "Subscription",
+                    userId,
+                    planData.Value.price,
+                    session.Id,
+                    subscriptionId: planId
+                );
+                await _eventBus.PublishAsync(paymentEvent);
+                Console.WriteLine($"[Payments BC] Published PaymentProcessedEvent for subscription payment {payment.Id}");
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Plan upgraded successfully",
+                    userType = "Owner",
+                    planId,
+                    planName = planData.Value.planName,
+                    maxUnits = limits.Value.maxEquipment,
+                    transactionId = session.PaymentIntentId
+                });
+            }
+
+            var providerId = await _profilesFacade.FetchProviderIdByUserId(userId);
+            if (providerId > 0)
+            {
+                // Update Provider plan
+                var limits = await _subscriptionFacade.GetSubscriptionLimits(planId);
+                if (limits == null || limits.Value.maxClients == 0)
+                {
+                    return BadRequest(new
+                    {
+                        success = false,
+                        message = $"Plan {planId} is not a Provider plan"
+                    });
+                }
+
+                Console.WriteLine($"[CompletePlanUpgrade] Updating Provider {providerId} to plan {planId}");
+                await _profilesFacade.UpdateProviderPlan(providerId, planId, limits.Value.maxClients);
+                await _unitOfWork.CompleteAsync();
+
+                Console.WriteLine($"[CompletePlanUpgrade] Provider plan updated successfully");
+
+                // Publish PaymentProcessedEvent for async communication
+                var paymentEvent = new PaymentProcessedEvent(
+                    payment.Id,
+                    "Subscription",
+                    userId,
+                    planData.Value.price,
+                    session.Id,
+                    subscriptionId: planId
+                );
+                await _eventBus.PublishAsync(paymentEvent);
+                Console.WriteLine($"[Payments BC] Published PaymentProcessedEvent for subscription payment {payment.Id}");
+
+                return Ok(new
+                {
+                    success = true,
+                    message = "Plan upgraded successfully",
+                    userType = "Provider",
+                    planId,
+                    planName = planData.Value.planName,
+                    maxClients = limits.Value.maxClients,
+                    transactionId = session.PaymentIntentId
+                });
+            }
+
+            return BadRequest(new
+            {
+                success = false,
+                message = $"No Owner or Provider profile found for user {userId}"
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CompletePlanUpgrade] Error: {ex.Message}");
+            Console.WriteLine($"[CompletePlanUpgrade] Stack trace: {ex.StackTrace}");
+
+            return BadRequest(new
+            {
+                success = false,
+                message = $"Failed to complete upgrade: {ex.Message}"
+            });
+        }
+    }
+
+    /// <summary>
+    /// Complete equipment rental after successful Stripe payment
+    /// </summary>
+    [HttpPost("complete-rental")]
+    [SwaggerOperation(
+        Summary = "Complete Equipment Rental",
+        Description = "Verifies Stripe payment and assigns equipment to owner",
+        OperationId = "CompleteEquipmentRental")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Rental completed successfully")]
+    [SwaggerResponse(StatusCodes.Status400BadRequest, "Rental completion failed")]
+    public async Task<IActionResult> CompleteEquipmentRental([FromBody] CompleteRentalRequest request)
+    {
+        try
+        {
+            Console.WriteLine($"[CompleteRental] Processing session: {request.SessionId}");
+
+            // 1. Verify payment with Stripe
+            var service = new SessionService();
+            var session = await service.GetAsync(request.SessionId);
+
+            Console.WriteLine($"[CompleteRental] Payment status: {session.PaymentStatus}");
+
+            if (session.PaymentStatus != "paid")
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = $"Payment not completed. Status: {session.PaymentStatus}"
+                });
+            }
+
+            // 2. Extract metadata
+            if (!session.Metadata.TryGetValue("equipmentId", out var equipmentIdStr) ||
+                !session.Metadata.TryGetValue("ownerId", out var ownerIdStr) ||
+                !session.Metadata.TryGetValue("providerId", out var providerIdStr) ||
+                !session.Metadata.TryGetValue("months", out var monthsStr) ||
+                !session.Metadata.TryGetValue("monthlyFee", out var monthlyFeeStr))
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = "Missing required metadata in payment session"
+                });
+            }
+
+            var equipmentId = int.Parse(equipmentIdStr);
+            var ownerId = int.Parse(ownerIdStr);
+            var providerId = int.Parse(providerIdStr);
+            var months = int.Parse(monthsStr);
+            var monthlyFee = decimal.Parse(monthlyFeeStr);
+
+            Console.WriteLine($"[CompleteRental] EquipmentId: {equipmentId}, OwnerId: {ownerId}, ProviderId: {providerId}, Months: {months}");
+
+            // 3. Get equipment
+            var equipmentData = await _equipmentFacade.GetEquipmentRentalData(equipmentId);
+            if (equipmentData == null)
+            {
+                return BadRequest(new
+                {
+                    success = false,
+                    message = $"Equipment {equipmentId} not found"
+                });
+            }
+
+            Console.WriteLine($"[CompleteRental] Equipment: {equipmentData.Value.name}");
+
+            // 4. Calculate payment breakdown
+            var totalAmount = monthlyFee * months;
+            var platformFee = Math.Round(totalAmount * (PLATFORM_FEE_PERCENTAGE / 100), 2);
+            var providerAmount = totalAmount - platformFee;
+
+            Console.WriteLine($"[CompleteRental] Payment breakdown - Total: ${totalAmount}, Platform: ${platformFee}, Provider gets: ${providerAmount}");
+
+            // 5. Update provider balance
+            var balanceUpdated = await _profilesFacade.UpdateProviderBalance(providerId, providerAmount, $"Rental revenue for equipment {equipmentData.Value.name}");
+            if (balanceUpdated)
+            {
+                Console.WriteLine($"[CompleteRental] Provider balance updated with ${providerAmount}");
+            }
+
+            // 6. Set rental dates and assign equipment to owner
+            // Calculate rental period
+            var startDate = DateTimeOffset.UtcNow;
+            var endDate = startDate.AddMonths(months);
+
+            Console.WriteLine($"[CompleteRental] Setting rental period: {startDate:yyyy-MM-dd} to {endDate:yyyy-MM-dd}");
+
+            // Set rental dates on the equipment
+            if (!equipmentData.Value.hasRentalInfo)
+            {
+                throw new InvalidOperationException("Equipment does not have rental information");
+            }
+
+            var rentalProcessed = await _equipmentFacade.ProcessEquipmentRental(equipmentId, ownerId, startDate, endDate);
+            if (rentalProcessed)
+            {
+                Console.WriteLine($"[CompleteRental] Equipment rental assigned to owner {ownerId} for {months} month(s)");
+            }
+
+            // 7. Save all changes
+            await _unitOfWork.CompleteAsync();
+
+            // 8. Publish EquipmentRentalCompletedEvent for async communication
+            var rentalEvent = new EquipmentRentalCompletedEvent(
+                equipmentId,
+                equipmentData.Value.name,
+                equipmentData.Value.type,
+                ownerId,
+                providerId,
+                months,
+                monthlyFee,
+                totalAmount,
+                platformFee,
+                providerAmount,
+                startDate,
+                endDate,
+                session.Id
+            );
+            await _eventBus.PublishAsync(rentalEvent);
+            Console.WriteLine($"[Payments BC] Published EquipmentRentalCompletedEvent for equipment {equipmentId}");
+
+            // 9. Get owner and provider details for response
+            var ownerName = await _profilesFacade.GetOwnerNameByOwnerId(ownerId);
+            var providerCompanyName = await _profilesFacade.FetchProviderCompanyName(providerId);
+
+            // 10. Send notifications
+            var providerUserId = await _profilesFacade.GetProviderUserIdByProviderId(providerId);
+
+            // Notify owner about successful rental
+            var ownerMessage = $"You have successfully rented {equipmentData.Value.name} for {months} month(s). Rental ends on {endDate:yyyy-MM-dd}.";
+            await _notificationFacade.CreateInAppNotification(ownerId, "🎉 Rental Completed", ownerMessage);
+
+            // Notify provider about payment received
+            if (providerUserId > 0)
+            {
+                var providerMessage = $"Payment of ${providerAmount:F2} received for rental: {equipmentData.Value.name} ({months} months)";
+                await _notificationFacade.CreateInAppNotification(providerUserId, "💰 Payment Received", providerMessage);
+            }
+
+            Console.WriteLine($"[CompleteRental] Notifications sent to both parties");
+
+            return Ok(new
+            {
+                success = true,
+                message = $"Equipment rented successfully for {months} month(s)",
+                rental = new
+                {
+                    equipmentId,
+                    equipmentName = equipmentData.Value.name,
+                    equipmentType = equipmentData.Value.type,
+                    renterId = ownerId,
+                    renterName = ownerName != null ? $"{ownerName.Value.firstName} {ownerName.Value.lastName}" : "Unknown",
+                    providerId,
+                    providerName = providerCompanyName ?? "Unknown",
+                    rentalStartDate = startDate,
+                    rentalEndDate = endDate,
+                    durationMonths = months,
+                    monthlyFee = monthlyFee,
+                    totalAmount,
+                    platformFee,
+                    providerReceived = providerAmount,
+                    platformFeePercentage = PLATFORM_FEE_PERCENTAGE,
+                    transactionId = session.PaymentIntentId,
+                    completedAt = DateTime.UtcNow
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CompleteRental] Error: {ex.Message}");
+            Console.WriteLine($"[CompleteRental] Stack trace: {ex.StackTrace}");
+
+            return BadRequest(new
+            {
+                success = false,
+                message = $"Failed to complete rental: {ex.Message}"
+            });
+        }
+    }
+
+    /// <summary>
+    /// Test Stripe payment processing
+    /// </summary>
+    /// <remarks>
+    /// Test with Stripe test cards:
+    /// - Success: 4242 4242 4242 4242
+    /// - Decline: 4000 0000 0000 0002
+    /// - Requires authentication: 4000 0027 6000 3184
+    ///
+    /// Use any future expiry date, any 3-digit CVC, any postal code
+    /// </remarks>
+    [HttpPost("stripe/test")]
+    [SwaggerOperation(
+        Summary = "Test Stripe Payment",
+        Description = "Create a test payment using Stripe provider",
+        OperationId = "TestStripePayment")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Payment processed", typeof(PaymentResult))]
+    [SwaggerResponse(StatusCodes.Status400BadRequest, "Payment failed")]
+    public async Task<IActionResult> TestStripePayment([FromBody] TestPaymentRequest request)
+    {
+        var paymentRequest = new PaymentRequest
+        {
+            Amount = request.Amount,
+            Currency = request.Currency,
+            Description = request.Description,
+            CustomerEmail = request.CustomerEmail,
+            CustomerName = request.CustomerName,
+            PaymentToken = request.PaymentToken,
+            Metadata = new Dictionary<string, string>
+            {
+                { "test", "true" },
+                { "orderId", Guid.NewGuid().ToString() }
+            }
+        };
+
+        var result = await _stripeProvider.CreatePaymentAsync(paymentRequest);
+
+        if (result.Success)
+        {
+            return Ok(new
+            {
+                success = true,
+                message = "Payment successful!",
+                transactionId = result.TransactionId,
+                amount = result.Amount,
+                currency = result.Currency,
+                status = result.Status.ToString(),
+                provider = "Stripe"
+            });
+        }
+
+        return BadRequest(new
+        {
+            success = false,
+            message = result.ErrorMessage,
+            status = result.Status.ToString(),
+            provider = "Stripe"
+        });
+    }
+
+    /// <summary>
+    /// Test Culqi payment processing
+    /// </summary>
+    [HttpPost("culqi/test")]
+    [SwaggerOperation(
+        Summary = "Test Culqi Payment",
+        Description = "Create a test payment using Culqi provider (Peru)",
+        OperationId = "TestCulqiPayment")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Payment processed", typeof(PaymentResult))]
+    [SwaggerResponse(StatusCodes.Status400BadRequest, "Payment failed")]
+    public async Task<IActionResult> TestCulqiPayment([FromBody] TestPaymentRequest request)
+    {
+        var paymentRequest = new PaymentRequest
+        {
+            Amount = request.Amount,
+            Currency = request.Currency,
+            Description = request.Description,
+            CustomerEmail = request.CustomerEmail,
+            CustomerName = request.CustomerName,
+            PaymentToken = request.PaymentToken,
+            Metadata = new Dictionary<string, string>
+            {
+                { "test", "true" },
+                { "orderId", Guid.NewGuid().ToString() }
+            }
+        };
+
+        var result = await _culqiProvider.CreatePaymentAsync(paymentRequest);
+
+        if (result.Success)
+        {
+            return Ok(new
+            {
+                success = true,
+                message = "Payment successful!",
+                transactionId = result.TransactionId,
+                amount = result.Amount,
+                currency = result.Currency,
+                status = result.Status.ToString(),
+                provider = "Culqi"
+            });
+        }
+
+        return BadRequest(new
+        {
+            success = false,
+            message = result.ErrorMessage,
+            status = result.Status.ToString(),
+            provider = "Culqi"
+        });
+    }
+
+    /// <summary>
+    /// Test Izipay payment processing
+    /// </summary>
+    [HttpPost("izipay/test")]
+    [SwaggerOperation(
+        Summary = "Test Izipay Payment",
+        Description = "Create a test payment using Izipay provider (Peru)",
+        OperationId = "TestIzipayPayment")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Payment processed", typeof(PaymentResult))]
+    [SwaggerResponse(StatusCodes.Status400BadRequest, "Payment failed")]
+    public async Task<IActionResult> TestIzipayPayment([FromBody] TestPaymentRequest request)
+    {
+        var paymentRequest = new PaymentRequest
+        {
+            Amount = request.Amount,
+            Currency = request.Currency,
+            Description = request.Description,
+            CustomerEmail = request.CustomerEmail,
+            CustomerName = request.CustomerName,
+            PaymentToken = request.PaymentToken,
+            Metadata = new Dictionary<string, string>
+            {
+                { "test", "true" },
+                { "orderId", Guid.NewGuid().ToString() }
+            }
+        };
+
+        var result = await _izipayProvider.CreatePaymentAsync(paymentRequest);
+
+        if (result.Success)
+        {
+            return Ok(new
+            {
+                success = true,
+                message = "Payment successful!",
+                transactionId = result.TransactionId,
+                amount = result.Amount,
+                currency = result.Currency,
+                status = result.Status.ToString(),
+                provider = "Izipay"
+            });
+        }
+
+        return BadRequest(new
+        {
+            success = false,
+            message = result.ErrorMessage,
+            status = result.Status.ToString(),
+            provider = "Izipay"
+        });
+    }
+
+    /// <summary>
+    /// Get payment status from any provider
+    /// </summary>
+    [HttpGet("{provider}/{transactionId}")]
+    [SwaggerOperation(
+        Summary = "Get Payment Status",
+        Description = "Check the status of a payment by provider and transaction ID",
+        OperationId = "GetPaymentStatus")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Payment status retrieved")]
+    [SwaggerResponse(StatusCodes.Status404NotFound, "Payment not found")]
+    public async Task<IActionResult> GetPaymentStatus(string provider, string transactionId)
+    {
+        ProviderPaymentStatus status;
+
+        switch (provider.ToLower())
+        {
+            case "stripe":
+                status = await _stripeProvider.GetPaymentStatusAsync(transactionId);
+                break;
+            case "culqi":
+                status = await _culqiProvider.GetPaymentStatusAsync(transactionId);
+                break;
+            case "izipay":
+                status = await _izipayProvider.GetPaymentStatusAsync(transactionId);
+                break;
+            default:
+                return BadRequest(new { message = "Invalid provider. Use: stripe, culqi, or izipay" });
+        }
+
+        return Ok(new
+        {
+            transactionId,
+            provider,
+            status = status.ToString()
+        });
+    }
+}
+
+/// <summary>
+/// Checkout session request for Stripe
+/// </summary>
+public record CheckoutSessionRequest
+{
+    public int UserId { get; init; }
+    public int PlanId { get; init; }
+    public decimal Amount { get; init; } = 0;  // Optional, defaults to 0 (will use $50 if not provided)
+    public string SuccessUrl { get; init; } = string.Empty;
+    public string CancelUrl { get; init; } = string.Empty;
+}
+
+/// <summary>
+/// Complete upgrade request
+/// </summary>
+public record CompleteUpgradeRequest
+{
+    /// <summary>
+    /// Stripe checkout session ID
+    /// </summary>
+    public string SessionId { get; init; } = string.Empty;
+}
+
+/// <summary>
+/// Complete rental request
+/// </summary>
+public record CompleteRentalRequest
+{
+    /// <summary>
+    /// Stripe checkout session ID
+    /// </summary>
+    public string SessionId { get; init; } = string.Empty;
+}
+
+/// <summary>
+/// Test payment request
+/// </summary>
+public record TestPaymentRequest
+{
+    /// <summary>
+    /// Amount to charge (e.g., 50.00)
+    /// </summary>
+    public decimal Amount { get; init; } = 50.00m;
+
+    /// <summary>
+    /// Currency code (USD, PEN, EUR)
+    /// </summary>
+    public string Currency { get; init; } = "USD";
+
+    /// <summary>
+    /// Payment description
+    /// </summary>
+    public string Description { get; init; } = "Test payment";
+
+    /// <summary>
+    /// Customer email
+    /// </summary>
+    public string CustomerEmail { get; init; } = "test@example.com";
+
+    /// <summary>
+    /// Customer name
+    /// </summary>
+    public string CustomerName { get; init; } = "Test Customer";
+
+    /// <summary>
+    /// Payment token from frontend (card token, payment method ID, etc.)
+    /// For Stripe: Use payment method ID like "pm_card_visa"
+    /// </summary>
+    public string PaymentToken { get; init; } = "pm_card_visa";
+}

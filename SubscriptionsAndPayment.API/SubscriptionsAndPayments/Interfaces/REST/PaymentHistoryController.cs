@@ -1,0 +1,307 @@
+using System.Net.Mime;
+using Microsoft.AspNetCore.Mvc;
+using Swashbuckle.AspNetCore.Annotations;
+using OsitoPolar.Subscriptions.Service.Domain.Repositories;
+using OsitoPolar.Subscriptions.Service.Infrastructure.External.Http;
+using OsitoPolar.Subscriptions.Service.Interfaces.ACL;
+
+namespace OsitoPolar.Subscriptions.Service.Interfaces.REST;
+
+/// <summary>
+/// Controller for payment history (Owners and Providers)
+/// </summary>
+[ApiController]
+[Route("api/v1/payment-history")]
+[Produces(MediaTypeNames.Application.Json)]
+[SwaggerTag("Payment History")]
+public class PaymentHistoryController : ControllerBase
+{
+    private readonly IServicePaymentRepository _servicePaymentRepository;
+    private readonly IPaymentRepository _paymentRepository;
+    private readonly ISubscriptionContextFacade _subscriptionFacade;
+    private readonly IProfilesHttpFacade _profilesFacade;
+    private readonly IWorkOrdersHttpFacade _workOrdersFacade;
+    private readonly ILogger<PaymentHistoryController> _logger;
+
+    public PaymentHistoryController(
+        IServicePaymentRepository servicePaymentRepository,
+        IPaymentRepository paymentRepository,
+        ISubscriptionContextFacade subscriptionFacade,
+        IProfilesHttpFacade profilesFacade,
+        IWorkOrdersHttpFacade workOrdersFacade,
+        ILogger<PaymentHistoryController> logger)
+    {
+        _servicePaymentRepository = servicePaymentRepository;
+        _paymentRepository = paymentRepository;
+        _subscriptionFacade = subscriptionFacade;
+        _profilesFacade = profilesFacade;
+        _workOrdersFacade = workOrdersFacade;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Get payment history for an owner
+    /// </summary>
+    [HttpGet("owner/{userId:int}")]
+    [SwaggerOperation(
+        Summary = "Get Owner Payment History",
+        Description = "Returns all service payments made by the specified owner",
+        OperationId = "GetOwnerPaymentHistory")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Payment history retrieved")]
+    [SwaggerResponse(StatusCodes.Status403Forbidden, "Only owners can view owner payment history")]
+    public async Task<IActionResult> GetOwnerPaymentHistory(int userId)
+    {
+        try
+        {
+            var ownerId = await _profilesFacade.FetchOwnerIdByUserId(userId);
+            if (ownerId == 0)
+                return StatusCode(StatusCodes.Status403Forbidden,
+                    new { message = "Only owners can view owner payment history" });
+
+            _logger.LogInformation("Retrieving payment history for owner {OwnerId}", ownerId);
+
+            // Get subscription payments
+            var subscriptionPayments = await _paymentRepository.FindByUserIdAsync(userId);
+
+            // Get service payments
+            var servicePayments = await _servicePaymentRepository.FindByOwnerIdAsync(ownerId);
+
+            var paymentHistory = new List<object>();
+
+            // Add subscription payments
+            foreach (var payment in subscriptionPayments)
+            {
+                var subscriptionData = await _subscriptionFacade.GetSubscriptionDataById(payment.SubscriptionId);
+
+                paymentHistory.Add(new
+                {
+                    paymentId = payment.Id,
+                    type = "Subscription",
+                    description = $"Subscription: {subscriptionData?.planName ?? "Plan"}",
+                    totalAmount = payment.Amount.Amount,
+                    platformFee = 0m,
+                    providerAmount = 0m,
+                    status = "Completed",
+                    createdAt = DateTime.Now,
+                    completedAt = (DateTime?)null,
+                    stripeSessionId = payment.StripeSession.SessionId
+                });
+            }
+
+            // Add service payments
+            foreach (var payment in servicePayments)
+            {
+                // Get work order details
+                var workOrderData = await _workOrdersFacade.GetWorkOrderData(payment.WorkOrderId);
+
+                paymentHistory.Add(new
+                {
+                    paymentId = payment.Id,
+                    type = "Service",
+                    workOrderId = payment.WorkOrderId,
+                    workOrderNumber = workOrderData?.WorkOrderNumber ?? "N/A",
+                    workOrderTitle = workOrderData?.Title ?? "N/A",
+                    serviceRequestId = payment.ServiceRequestId,
+                    providerId = payment.ProviderId,
+                    description = payment.Description,
+                    totalAmount = payment.TotalAmount,
+                    platformFee = payment.PlatformFee,
+                    providerAmount = payment.ProviderAmount,
+                    status = payment.Status,
+                    createdAt = payment.CreatedAt,
+                    completedAt = payment.CompletedAt,
+                    stripePaymentIntentId = payment.StripePaymentIntentId
+                });
+            }
+
+            var totalSubscriptionPayments = subscriptionPayments.Sum(p => p.Amount.Amount);
+            var totalServicePayments = servicePayments.Sum(p => p.TotalAmount);
+            var totalPaid = totalSubscriptionPayments + totalServicePayments;
+            var totalPlatformFees = servicePayments.Sum(p => p.PlatformFee);
+
+            var ownerName = await _profilesFacade.GetOwnerNameByOwnerId(ownerId);
+
+            return Ok(new
+            {
+                ownerId,
+                ownerName = ownerName != null ? $"{ownerName.Value.firstName} {ownerName.Value.lastName}" : "Unknown",
+                totalPayments = subscriptionPayments.Count() + servicePayments.Count(),
+                totalPaid,
+                totalSubscriptionPayments,
+                totalServicePayments,
+                totalPlatformFees,
+                payments = paymentHistory.OrderByDescending(p => ((dynamic)p).createdAt).ToList()
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error retrieving owner payment history");
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Get payment history for a provider
+    /// </summary>
+    [HttpGet("provider/{userId:int}")]
+    [SwaggerOperation(
+        Summary = "Get Provider Payment History",
+        Description = "Returns all service payments received by the specified provider",
+        OperationId = "GetProviderPaymentHistory")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Payment history retrieved")]
+    [SwaggerResponse(StatusCodes.Status403Forbidden, "Only providers can view provider payment history")]
+    public async Task<IActionResult> GetProviderPaymentHistory(int userId)
+    {
+        try
+        {
+            var providerId = await _profilesFacade.FetchProviderIdByUserId(userId);
+            if (providerId == 0)
+                return StatusCode(StatusCodes.Status403Forbidden,
+                    new { message = "Only providers can view provider payment history" });
+
+            _logger.LogInformation("Retrieving payment history for provider {ProviderId}", providerId);
+
+            // Get subscription payments (their own subscription)
+            var subscriptionPayments = await _paymentRepository.FindByUserIdAsync(userId);
+
+            // Get service payments (money received from services)
+            var servicePayments = await _servicePaymentRepository.FindByProviderIdAsync(providerId);
+
+            var paymentHistory = new List<object>();
+
+            // Add subscription payments (expenses)
+            foreach (var payment in subscriptionPayments)
+            {
+                var subscriptionData = await _subscriptionFacade.GetSubscriptionDataById(payment.SubscriptionId);
+
+                paymentHistory.Add(new
+                {
+                    paymentId = payment.Id,
+                    type = "Subscription",
+                    description = $"Subscription: {subscriptionData?.planName ?? "Plan"}",
+                    totalAmount = payment.Amount.Amount,
+                    platformFee = 0m,
+                    providerReceived = -payment.Amount.Amount, // Negative because it's an expense
+                    status = "Completed",
+                    createdAt = DateTime.Now,
+                    completedAt = (DateTime?)null,
+                    stripeSessionId = payment.StripeSession.SessionId
+                });
+            }
+
+            // Add service payments (income)
+            foreach (var payment in servicePayments)
+            {
+                // Get work order details
+                var workOrderData = await _workOrdersFacade.GetWorkOrderData(payment.WorkOrderId);
+
+                paymentHistory.Add(new
+                {
+                    paymentId = payment.Id,
+                    type = "Service",
+                    workOrderId = payment.WorkOrderId,
+                    workOrderNumber = workOrderData?.WorkOrderNumber ?? "N/A",
+                    workOrderTitle = workOrderData?.Title ?? "N/A",
+                    serviceRequestId = payment.ServiceRequestId,
+                    ownerId = payment.OwnerId,
+                    description = payment.Description,
+                    totalAmount = payment.TotalAmount,
+                    platformFee = payment.PlatformFee,
+                    providerReceived = payment.ProviderAmount,
+                    status = payment.Status,
+                    createdAt = payment.CreatedAt,
+                    completedAt = payment.CompletedAt,
+                    stripePaymentIntentId = payment.StripePaymentIntentId
+                });
+            }
+
+            var totalSubscriptionExpenses = subscriptionPayments.Sum(p => p.Amount.Amount);
+            var totalReceived = servicePayments.Sum(p => p.ProviderAmount);
+            var totalGrossRevenue = servicePayments.Sum(p => p.TotalAmount);
+            var totalPlatformFees = servicePayments.Sum(p => p.PlatformFee);
+
+            var providerData = await _profilesFacade.GetProviderProfileForAuthByUserId(userId);
+
+            return Ok(new
+            {
+                providerId,
+                providerName = providerData?.companyName ?? "Unknown",
+                currentBalance = providerData?.balance ?? 0m,
+                totalPayments = subscriptionPayments.Count() + servicePayments.Count(),
+                totalReceived, // What provider received from services (after platform fees)
+                totalGrossRevenue, // Total amount paid by customers
+                totalPlatformFees, // Total fees paid to platform
+                totalSubscriptionExpenses, // Total spent on subscription
+                netIncome = totalReceived - totalSubscriptionExpenses, // Net after expenses
+                payments = paymentHistory.OrderByDescending(p => ((dynamic)p).createdAt).ToList()
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error retrieving provider payment history");
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Get specific payment details
+    /// </summary>
+    [HttpGet("{paymentId:int}")]
+    [SwaggerOperation(
+        Summary = "Get Payment Details",
+        Description = "Returns detailed information about a specific payment",
+        OperationId = "GetPaymentDetails")]
+    [SwaggerResponse(StatusCodes.Status200OK, "Payment details retrieved")]
+    [SwaggerResponse(StatusCodes.Status404NotFound, "Payment not found")]
+    public async Task<IActionResult> GetPaymentDetails(int paymentId)
+    {
+        try
+        {
+            var payment = await _servicePaymentRepository.FindByIdAsync(paymentId);
+            if (payment == null)
+                return NotFound(new { message = "Payment not found" });
+
+            // Get work order details
+            var workOrderData = await _workOrdersFacade.GetWorkOrderData(payment.WorkOrderId);
+
+            return Ok(new
+            {
+                paymentId = payment.Id,
+                workOrder = workOrderData != null ? new
+                {
+                    id = workOrderData.Id,
+                    workOrderNumber = workOrderData.WorkOrderNumber,
+                    title = workOrderData.Title,
+                    description = "N/A", // Not available through facade
+                    status = workOrderData.Status
+                } : null,
+                serviceRequestId = payment.ServiceRequestId,
+                owner = new
+                {
+                    id = payment.OwnerId
+                },
+                provider = new
+                {
+                    id = payment.ProviderId
+                },
+                amounts = new
+                {
+                    total = payment.TotalAmount,
+                    platformFee = payment.PlatformFee,
+                    providerReceived = payment.ProviderAmount
+                },
+                status = payment.Status,
+                description = payment.Description,
+                createdAt = payment.CreatedAt,
+                completedAt = payment.CompletedAt,
+                stripePaymentIntentId = payment.StripePaymentIntentId,
+                stripeTransactionId = payment.StripeTransactionId
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error retrieving payment details");
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+}
